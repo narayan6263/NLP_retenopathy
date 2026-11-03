@@ -1,0 +1,157 @@
+"""
+Custom attention layers for the DR-detection model.
+
+  - ChannelAttention / SpatialAttention -> combined into CBAM
+    (Convolutional Block Attention Module, Woo et al. 2018)
+  - LocalAttentionPooling (LAP)
+    Replaces GlobalAveragePooling2D with an attention-weighted pooling
+    operation, so the network aggregates features with more weight on
+    the local regions (lesions) that matter, instead of averaging the
+    whole image equally.
+"""
+
+import tensorflow as tf
+from tensorflow.keras import layers
+
+
+class ChannelAttention(layers.Layer):
+    """Channel attention sub-module of CBAM.
+
+    Squeezes the spatial dimensions with both average- and max-pooling,
+    passes each through a shared MLP, sums them, and applies a sigmoid
+    to get a per-channel attention weight.
+    """
+
+    def __init__(self, reduction_ratio=8, **kwargs):
+        super().__init__(**kwargs)
+        self.reduction_ratio = reduction_ratio
+
+    def build(self, input_shape):
+        channels = input_shape[-1]
+        hidden = max(channels // self.reduction_ratio, 8)
+
+        self.avg_pool = layers.GlobalAveragePooling2D(keepdims=True)
+        self.max_pool = layers.GlobalMaxPooling2D(keepdims=True)
+
+        # Shared MLP (implemented as 1x1 convs so it works on the pooled maps directly)
+        self.mlp_dense1 = layers.Dense(hidden, activation="relu", use_bias=True)
+        self.mlp_dense2 = layers.Dense(channels, use_bias=True)
+
+        super().build(input_shape)
+
+    def call(self, x):
+        avg_out = self.mlp_dense2(self.mlp_dense1(self.avg_pool(x)))
+        max_out = self.mlp_dense2(self.mlp_dense1(self.max_pool(x)))
+        attention = tf.nn.sigmoid(avg_out + max_out)
+        return x * attention
+
+    def get_config(self):
+        config = super().get_config()
+        config.update({"reduction_ratio": self.reduction_ratio})
+        return config
+
+
+class SpatialAttention(layers.Layer):
+    """Spatial attention sub-module of CBAM.
+
+    Pools across the channel axis (avg + max), concatenates the two
+    single-channel maps, and runs a conv to produce one spatial
+    attention mask that is applied to every channel.
+    """
+
+    def __init__(self, kernel_size=7, **kwargs):
+        super().__init__(**kwargs)
+        self.kernel_size = kernel_size
+
+    def build(self, input_shape):
+        self.conv = layers.Conv2D(
+            filters=1,
+            kernel_size=self.kernel_size,
+            padding="same",
+            activation="sigmoid",
+            use_bias=False,
+        )
+        super().build(input_shape)
+
+    def call(self, x):
+        avg_out = tf.reduce_mean(x, axis=-1, keepdims=True)
+        max_out = tf.reduce_max(x, axis=-1, keepdims=True)
+        concat = tf.concat([avg_out, max_out], axis=-1)
+        attention = self.conv(concat)
+        return x * attention
+
+    def get_config(self):
+        config = super().get_config()
+        config.update({"kernel_size": self.kernel_size})
+        return config
+
+
+class CBAM(layers.Layer):
+    """Convolutional Block Attention Module = Channel Attention -> Spatial Attention,
+    applied sequentially, each as a residual refinement of the feature map.
+    """
+
+    def __init__(self, reduction_ratio=8, spatial_kernel_size=7, **kwargs):
+        super().__init__(**kwargs)
+        self.channel_attention = ChannelAttention(reduction_ratio)
+        self.spatial_attention = SpatialAttention(spatial_kernel_size)
+
+    def call(self, x):
+        x = self.channel_attention(x)
+        x = self.spatial_attention(x)
+        return x
+
+    def get_config(self):
+        config = super().get_config()
+        config.update(
+            {
+                "reduction_ratio": self.channel_attention.reduction_ratio,
+                "spatial_kernel_size": self.spatial_attention.kernel_size,
+            }
+        )
+        return config
+
+
+class LocalAttentionPooling(layers.Layer):
+    """Local Attention Pooling (LAP).
+
+    Standard GlobalAveragePooling2D treats every spatial location as
+    equally important. LAP instead learns a per-location importance
+    score (via a 1x1 conv -> softmax over the spatial grid) and takes a
+    weighted sum of the feature map, so localized, high-signal regions
+    (e.g. microaneurysms, hemorrhages) contribute more to the final
+    feature vector than flat, uninformative background.
+    """
+
+    def __init__(self, **kwargs):
+        super().__init__(**kwargs)
+
+    def build(self, input_shape):
+        # 1x1 conv producing a single "importance" score per spatial location
+        self.score_conv = layers.Conv2D(filters=1, kernel_size=1, padding="same")
+        super().build(input_shape)
+
+    def call(self, x):
+        # x: (batch, H, W, C)
+        scores = self.score_conv(x)  # (batch, H, W, 1)
+        shape = tf.shape(x)
+        h, w = shape[1], shape[2]
+
+        flat_scores = tf.reshape(scores, [shape[0], h * w, 1])
+        attention_weights = tf.nn.softmax(flat_scores, axis=1)  # softmax over spatial positions
+        attention_weights = tf.reshape(attention_weights, [shape[0], h, w, 1])
+
+        weighted = x * attention_weights  # broadcast over channels
+        pooled = tf.reduce_sum(weighted, axis=[1, 2])  # (batch, C)
+        return pooled
+
+    def compute_output_shape(self, input_shape):
+        return (input_shape[0], input_shape[-1])
+
+
+CUSTOM_OBJECTS = {
+    "ChannelAttention": ChannelAttention,
+    "SpatialAttention": SpatialAttention,
+    "CBAM": CBAM,
+    "LocalAttentionPooling": LocalAttentionPooling,
+}
